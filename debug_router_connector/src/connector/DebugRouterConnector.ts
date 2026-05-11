@@ -45,8 +45,16 @@ import type {
   ConnectionTraceOptions,
   ConnectionTraceRecorder,
 } from "../trace/ConnectionTraceRecorder";
+import { ProxyHost } from "../proxy/ProxyHost";
+import { ProxyRemoteClient } from "../proxy/ProxyRemoteClient";
+import {
+  isProxyEnabled,
+  readDiscovery,
+  tryAcquireProxyHostLock,
+} from "../proxy/discovery";
 
 export type devOption = {
+  enableProxy?: boolean;
   manualConnect?: boolean;
   enableAndroid?: boolean;
   enableIOS?: boolean;
@@ -117,6 +125,8 @@ export class DebugRouterConnector {
   wss: WebSocketController | null = null;
   private currentStatus: MultiOpenStatus = MultiOpenStatus.unInit;
   private devicesManager: Set<DeviceManager>;
+  private proxyHost: ProxyHost | null = null;
+  private proxyRemote: ProxyRemoteClient | null = null;
   constructor(
     option: devOption = {
       manualConnect: false,
@@ -146,8 +156,12 @@ export class DebugRouterConnector {
         { option: msg },
       );
     }
-    this.prepareDriverDataDir();
-    this.startMonitorMultiOpen();
+    const proxyEnabled = option.enableProxy ?? isProxyEnabled();
+    const isProxyHost = proxyEnabled ? tryAcquireProxyHostLock() : false;
+    if (!proxyEnabled) {
+      this.prepareDriverDataDir();
+      this.startMonitorMultiOpen();
+    }
     this.manualConnect = option.manualConnect;
     this.enableWebSocket = option.enableWebSocket;
     this.roomId = option.websocketOption?.roomId;
@@ -175,6 +189,14 @@ export class DebugRouterConnector {
     );
     this.devicesManager = new Set<DeviceManager>();
     this.driverClient = new DriverClient(this.createClientId());
+    if (proxyEnabled && !isProxyHost) {
+      this.currentStatus = MultiOpenStatus.unattached;
+      this.proxyRemote = new ProxyRemoteClient(this, readDiscovery());
+      if (!this.manualConnect) {
+        this.connectDevices();
+      }
+      return;
+    }
     if (this.enableAndroid) {
       this.devicesManager.add(new AndroidDeviceManager(this, this.adbOption));
     }
@@ -200,6 +222,15 @@ export class DebugRouterConnector {
         });
         defaultLogger.error("networkDeviceOpt == undefined");
       }
+    }
+    if (proxyEnabled && isProxyHost) {
+      this.proxyHost = new ProxyHost(this);
+      this.proxyHost.start().catch((error) => {
+        defaultLogger.warn(
+          "DebugRouterProxy: start proxy host failed:" + error?.message,
+        );
+      });
+      this.currentStatus = MultiOpenStatus.attached;
     }
     if (!this.manualConnect) {
       this.connectDevices();
@@ -330,6 +361,9 @@ export class DebugRouterConnector {
   }
 
   disableAllClients() {
+    if (this.proxyRemote) {
+      return;
+    }
     defaultLogger.info("disableAllClients");
     // close usb autoConnect
     this.devices.forEach((device) => {
@@ -341,6 +375,10 @@ export class DebugRouterConnector {
   }
 
   startWatchAllClients(force: boolean = true) {
+    if (this.proxyRemote) {
+      this.proxyRemote.startWatchAllClients(force);
+      return;
+    }
     defaultLogger.debug("startWatchAllClients");
     if (!force && this.currentStatus === MultiOpenStatus.attached) {
       defaultLogger.debug("startWatchAllClients: has already attached");
@@ -370,6 +408,11 @@ export class DebugRouterConnector {
     serial: string | null = null,
     isAutoListenClients: boolean = true,
   ): Promise<BaseDevice[]> {
+    if (this.proxyRemote) {
+      return this.proxyRemote.connectDevices(timeout, serial) as Promise<
+        BaseDevice[]
+      >;
+    }
     await this.startDeviceListeners();
     return this.getDevices(timeout, serial);
   }
@@ -383,6 +426,14 @@ export class DebugRouterConnector {
     waitTimeout: boolean = true,
     clientName: string | null = null,
   ): Promise<UsbClient[]> {
+    if (this.proxyRemote) {
+      return this.proxyRemote.connectUsbClients(
+        deviceId,
+        timeout,
+        waitTimeout,
+        clientName,
+      ) as Promise<UsbClient[]>;
+    }
     defaultLogger.debug(
       "connectUsbClients of :" +
         deviceId +
@@ -604,6 +655,11 @@ export class DebugRouterConnector {
     timeout: number = -1,
     serial: string | null = null,
   ): Promise<BaseDevice[]> {
+    if (this.proxyRemote) {
+      return this.proxyRemote.getDevices(timeout, serial) as Promise<
+        BaseDevice[]
+      >;
+    }
     return new Promise((resolve) => {
       if (timeout < 0) {
         resolve(this.findDevice(serial));
@@ -764,6 +820,9 @@ export class DebugRouterConnector {
   }
 
   handleUsbMessage(id: number, message: string) {
+    if (this.proxyHost?.routeUsbMessage(id, message)) {
+      return;
+    }
     if (this.wss) {
       const response = JSON.parse(message);
       if (response.data && response.data["sender"]) {
@@ -779,7 +838,10 @@ export class DebugRouterConnector {
     }
   }
 
-  handleWsMessage(id: number, message: string) {
+  handleWsMessage(id: number, message: string, fromWebClientId?: number) {
+    if (this.proxyHost?.routeWebMessage(id, message, fromWebClientId)) {
+      return;
+    }
     const client = this.usbClients.get(id);
     if (client) {
       const data = JSON.parse(message);
@@ -824,6 +886,10 @@ export class DebugRouterConnector {
 
   // send message to web platform
   sendMessageToWeb(message: string) {
+    if (this.proxyRemote) {
+      this.proxyRemote.sendMessageToWeb(message);
+      return;
+    }
     if (!this.enableWebSocket) {
       defaultLogger.warn("enableWebSocket isn't opened!");
       return;
@@ -837,6 +903,10 @@ export class DebugRouterConnector {
 
   // send message to app(include apps connected by usb and wifi)
   sendMessageToApp(id: number, message: string) {
+    if (this.proxyRemote) {
+      this.proxyRemote.sendMessageToApp(id, message);
+      return;
+    }
     if (!this.enableWebSocket) {
       defaultLogger.warn("enableWebSocket isn't opened!");
       return;
@@ -849,6 +919,26 @@ export class DebugRouterConnector {
   }
 
   async startWSServer(): Promise<void> {
+    if (this.proxyRemote) {
+      const result = await this.proxyRemote.startWSServer();
+      this.wssPort = result?.wssPort ?? this.wssPort;
+      this.wssHost = result?.wssHost;
+      this.roomId = result?.roomId;
+      this.wss = {
+        wssPath: result?.wssPath,
+        sendMessageToWeb: (message: string) => {
+          this.proxyRemote?.sendMessageToWeb(message);
+        },
+        sendMessageToApp: (id: number, message: string) => {
+          this.proxyRemote?.sendMessageToApp(id, message);
+        },
+        sendClientList: () => {},
+        sendDeviceList: () => {},
+        getAllWebsocketAppClients: () => new Map(),
+        getAllWebsocketWebClients: () => new Map(),
+      } as any;
+      return;
+    }
     return new Promise(async (resolve) => {
       if (this.enableWebSocket) {
         const port = this.wssPort;

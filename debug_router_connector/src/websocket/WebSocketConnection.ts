@@ -174,7 +174,7 @@ export class WebSocketClient extends Client {
       if (id == -1) {
         return;
       }
-      this.server.sendMessageToApp(id, message);
+      this.server.sendMessageToApp(id, message, this.clientId());
     } else {
       // message from app, only send to web
       const id = data.data?.sender ?? -1;
