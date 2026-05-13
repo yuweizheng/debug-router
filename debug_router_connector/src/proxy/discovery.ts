@@ -14,7 +14,8 @@ import {
 } from "./types";
 
 const proxyDir = path.join(driver_dir, "proxy-v1");
-const hostLockDir = path.join(proxyDir, "daemon.lock");
+const daemonLockDir = path.join(proxyDir, "daemon.lock");
+const spawnLockDir = path.join(proxyDir, "spawn.lock");
 const discoveryFile = path.join(proxyDir, "daemon.json");
 
 function ensureProxyDir() {
@@ -56,39 +57,77 @@ export function discoveryIsFresh(info: ProxyDiscoveryInfo | null): boolean {
   return Date.now() - info.heartbeat < PROXY_STALE_TIMEOUT;
 }
 
-export function tryAcquireProxyHostLock(): boolean {
+function clearStaleDaemonIfNeeded() {
   ensureProxyDir();
   const discovery = readDiscovery();
-  const lockAge = Date.now() - getMtime(hostLockDir);
+  const lockAge = Date.now() - getMtime(daemonLockDir);
   if (
-    fs.existsSync(hostLockDir) &&
+    fs.existsSync(daemonLockDir) &&
     !discoveryIsFresh(discovery) &&
     lockAge > PROXY_STALE_TIMEOUT
   ) {
     try {
-      fs.rmSync(hostLockDir, { recursive: true, force: true });
+      fs.rmSync(daemonLockDir, { recursive: true, force: true });
       fs.rmSync(discoveryFile, { force: true });
     } catch (error: any) {
       defaultLogger.warn(
-        "DebugRouterProxy: clear stale lock failed:" + error?.message,
+        "DebugRouterProxy: clear stale daemon failed:" + error?.message,
       );
     }
   }
+}
+
+function clearStaleSpawnLockIfNeeded() {
+  ensureProxyDir();
+  const lockAge = Date.now() - getMtime(spawnLockDir);
+  if (fs.existsSync(spawnLockDir) && lockAge > PROXY_STALE_TIMEOUT) {
+    try {
+      fs.rmSync(spawnLockDir, { recursive: true, force: true });
+    } catch (error: any) {
+      defaultLogger.warn(
+        "DebugRouterProxy: clear stale spawn lock failed:" + error?.message,
+      );
+    }
+  }
+}
+
+export function tryAcquireProxyDaemonLock(): boolean {
+  clearStaleDaemonIfNeeded();
   try {
-    fs.mkdirSync(hostLockDir);
+    fs.mkdirSync(daemonLockDir);
     return true;
   } catch {
     return false;
   }
 }
 
-export function releaseProxyHostLock() {
+export function releaseProxyDaemonLock() {
   try {
-    fs.rmSync(hostLockDir, { recursive: true, force: true });
+    fs.rmSync(daemonLockDir, { recursive: true, force: true });
     fs.rmSync(discoveryFile, { force: true });
   } catch (error: any) {
     defaultLogger.debug(
       "DebugRouterProxy: release lock failed:" + error?.message,
+    );
+  }
+}
+
+export function tryAcquireProxySpawnLock(): boolean {
+  clearStaleSpawnLockIfNeeded();
+  try {
+    fs.mkdirSync(spawnLockDir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function releaseProxySpawnLock() {
+  try {
+    fs.rmSync(spawnLockDir, { recursive: true, force: true });
+  } catch (error: any) {
+    defaultLogger.debug(
+      "DebugRouterProxy: release spawn lock failed:" + error?.message,
     );
   }
 }

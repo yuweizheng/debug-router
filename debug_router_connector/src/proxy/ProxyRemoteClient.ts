@@ -35,6 +35,7 @@ export class ProxyRemoteClient {
   constructor(
     private readonly driver: any,
     private discovery: ProxyDiscoveryInfo | null,
+    private readonly ensureDaemon?: () => void,
   ) {
     this.readyPromise = new Promise((resolve) => {
       this.readyResolve = resolve;
@@ -46,12 +47,14 @@ export class ProxyRemoteClient {
     if (!discoveryIsFresh(this.discovery)) {
       this.discovery = readDiscovery();
       if (!this.discovery) {
+        this.ensureDaemon?.();
         this.scheduleReconnect();
         return;
       }
     }
     const discovery = this.discovery;
     if (!discovery) {
+      this.ensureDaemon?.();
       this.scheduleReconnect();
       return;
     }
@@ -74,6 +77,7 @@ export class ProxyRemoteClient {
         this.discovery = null;
         this.resetReadyPromise();
         this.rejectPending(new Error("DebugRouterProxy connection closed"));
+        this.ensureDaemon?.();
         this.scheduleReconnect();
       }
     });
@@ -108,6 +112,16 @@ export class ProxyRemoteClient {
 
   private async ready() {
     await this.readyPromise;
+  }
+
+  close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    this.rejectPending(new Error("DebugRouterProxy remote closed"));
+    this.socket?.close();
+    this.socket = null;
   }
 
   private handleMessage(message: string) {
@@ -296,8 +310,12 @@ export class ProxyRemoteClient {
     return clients.map((client) => this.driver.usbClients.get(client.info.id));
   }
 
-  async startWSServer() {
-    return this.request("startWSServer");
+  async startWSServer(params?: {
+    enableWebSocket?: boolean;
+    wssPort?: number;
+    roomId?: string;
+  }) {
+    return this.request("startWSServer", params);
   }
 
   startWatchAllClients(force = true) {

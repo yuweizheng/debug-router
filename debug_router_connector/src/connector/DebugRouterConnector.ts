@@ -47,14 +47,13 @@ import type {
 } from "../trace/ConnectionTraceRecorder";
 import { ProxyHost } from "../proxy/ProxyHost";
 import { ProxyRemoteClient } from "../proxy/ProxyRemoteClient";
-import {
-  isProxyEnabled,
-  readDiscovery,
-  tryAcquireProxyHostLock,
-} from "../proxy/discovery";
+import { isProxyEnabled, readDiscovery } from "../proxy/discovery";
+import { ensureProxyDaemonStarted } from "../proxy/daemonLauncher";
 
 export type devOption = {
   enableProxy?: boolean;
+  internalProxyDaemon?: boolean;
+  proxyDaemonIdleTimeout?: number;
   manualConnect?: boolean;
   enableAndroid?: boolean;
   enableIOS?: boolean;
@@ -157,8 +156,8 @@ export class DebugRouterConnector {
       );
     }
     const proxyEnabled = option.enableProxy ?? isProxyEnabled();
-    const isProxyHost = proxyEnabled ? tryAcquireProxyHostLock() : false;
-    if (!proxyEnabled) {
+    const isProxyDaemon = option.internalProxyDaemon === true;
+    if (!proxyEnabled && !isProxyDaemon) {
       this.prepareDriverDataDir();
       this.startMonitorMultiOpen();
     }
@@ -189,9 +188,12 @@ export class DebugRouterConnector {
     );
     this.devicesManager = new Set<DeviceManager>();
     this.driverClient = new DriverClient(this.createClientId());
-    if (proxyEnabled && !isProxyHost) {
+    if (proxyEnabled && !isProxyDaemon) {
+      ensureProxyDaemonStarted(option);
       this.currentStatus = MultiOpenStatus.unattached;
-      this.proxyRemote = new ProxyRemoteClient(this, readDiscovery());
+      this.proxyRemote = new ProxyRemoteClient(this, readDiscovery(), () => {
+        ensureProxyDaemonStarted(option);
+      });
       if (!this.manualConnect) {
         this.connectDevices();
       }
@@ -223,13 +225,7 @@ export class DebugRouterConnector {
         defaultLogger.error("networkDeviceOpt == undefined");
       }
     }
-    if (proxyEnabled && isProxyHost) {
-      this.proxyHost = new ProxyHost(this);
-      this.proxyHost.start().catch((error) => {
-        defaultLogger.warn(
-          "DebugRouterProxy: start proxy host failed:" + error?.message,
-        );
-      });
+    if (isProxyDaemon) {
       this.currentStatus = MultiOpenStatus.attached;
     }
     if (!this.manualConnect) {
@@ -240,6 +236,12 @@ export class DebugRouterConnector {
   setMultiOpenCallback(callback: MultiOpenCallback) {
     this.multiOpenCallback = callback;
   }
+
+  attachProxyHost(proxyHost: ProxyHost) {
+    this.proxyHost = proxyHost;
+    this.currentStatus = MultiOpenStatus.attached;
+  }
+
   prepareDriverDataDir() {
     fslock.clearLockFileWhenProcessExit();
     try {
@@ -532,6 +534,10 @@ export class DebugRouterConnector {
       this.multiOpenMonitorTimer = undefined;
     }
     this.disableAllClients();
+    this.proxyRemote?.close();
+    this.proxyRemote = null;
+    this.proxyHost?.close();
+    this.proxyHost = null;
     if (this.wss) {
       this.wss.close();
       this.wss = null;
@@ -920,7 +926,11 @@ export class DebugRouterConnector {
 
   async startWSServer(): Promise<void> {
     if (this.proxyRemote) {
-      const result = await this.proxyRemote.startWSServer();
+      const result = await this.proxyRemote.startWSServer({
+        enableWebSocket: this.enableWebSocket,
+        wssPort: this.wssPort,
+        roomId: this.roomId,
+      });
       this.wssPort = result?.wssPort ?? this.wssPort;
       this.wssHost = result?.wssHost;
       this.roomId = result?.roomId;
@@ -934,6 +944,7 @@ export class DebugRouterConnector {
         },
         sendClientList: () => {},
         sendDeviceList: () => {},
+        close: () => {},
         getAllWebsocketAppClients: () => new Map(),
         getAllWebsocketWebClients: () => new Map(),
       } as any;

@@ -8,7 +8,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { defaultLogger } from "../utils/logger";
 import {
   createDiscovery,
-  releaseProxyHostLock,
+  releaseProxyDaemonLock,
   writeDiscovery,
 } from "./discovery";
 import {
@@ -16,6 +16,7 @@ import {
   PROXY_CONTROL_PATH,
   PROXY_HEARTBEAT_INTERVAL,
   ProxyEvent,
+  ProxyHostOptions,
   ProxyRequest,
   SerializedClient,
   SerializedDevice,
@@ -50,10 +51,14 @@ export class ProxyHost {
   private readonly controls = new Map<number, ControlConnection>();
   private readonly pending = new Map<number, PendingTarget>();
   private heartbeatTimer?: NodeJS.Timeout;
+  private idleTimer?: NodeJS.Timeout;
   private closed = false;
   private unregisterProcessCleanup?: () => void;
 
-  constructor(private readonly driver: any) {
+  constructor(
+    private readonly driver: any,
+    private readonly options: ProxyHostOptions = {},
+  ) {
     this.attachDriverEvents();
   }
 
@@ -111,6 +116,7 @@ export class ProxyHost {
       });
     });
     this.registerProcessCleanup();
+    this.scheduleIdleTimerIfNeeded();
   }
 
   close() {
@@ -121,13 +127,17 @@ export class ProxyHost {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
     }
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
     try {
       this.wss?.close();
       this.server?.close();
     } catch (error: any) {
       defaultLogger.debug("DebugRouterProxy: close failed:" + error?.message);
     }
-    releaseProxyHostLock();
+    releaseProxyDaemonLock();
   }
 
   private registerProcessCleanup() {
@@ -176,6 +186,7 @@ export class ProxyHost {
 
   private handleControlConnection(socket: WebSocket) {
     const id = ++this.frontendId;
+    this.cancelIdleTimer();
     this.controls.set(id, { id, socket });
     socket.on("message", (data) => {
       this.handleControlRequest(id, data.toString()).catch((error) => {
@@ -185,6 +196,7 @@ export class ProxyHost {
     socket.on("close", () => {
       this.controls.delete(id);
       this.clearPendingForControl(id);
+      this.scheduleIdleTimerIfNeeded();
     });
     this.sendControlEvent(id, {
       event: "snapshot",
@@ -193,6 +205,30 @@ export class ProxyHost {
         clients: this.serializeClients(),
       },
     });
+  }
+
+  private cancelIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  private scheduleIdleTimerIfNeeded() {
+    const timeout = this.options.idleTimeout;
+    if (this.closed || timeout === undefined || timeout < 0) {
+      return;
+    }
+    if (this.controls.size > 0 || this.idleTimer) {
+      return;
+    }
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = undefined;
+      if (!this.closed && this.controls.size === 0) {
+        defaultLogger.info("DebugRouterProxy: daemon idle timeout");
+        this.options.onIdleTimeout?.();
+      }
+    }, timeout);
   }
 
   private async handleControlRequest(controlId: number, raw: string) {
@@ -239,6 +275,23 @@ export class ProxyHost {
           ),
         );
       case "startWSServer":
+        if (params.enableWebSocket !== undefined) {
+          this.driver.enableWebSocket = params.enableWebSocket;
+        }
+        if (params.wssPort !== undefined) {
+          this.driver.wssPort = params.wssPort;
+        }
+        if (params.roomId !== undefined) {
+          this.driver.roomId = params.roomId;
+        }
+        if (this.driver.wss) {
+          return {
+            wssPath: this.driver.wss?.wssPath,
+            wssHost: this.driver.wssHost,
+            wssPort: this.driver.wssPort,
+            roomId: this.driver.roomId,
+          };
+        }
         await this.driver.startWSServer();
         return {
           wssPath: this.driver.wss?.wssPath,
